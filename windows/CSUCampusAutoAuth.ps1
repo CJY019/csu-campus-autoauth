@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$Startup,
+    [switch]$EditCredentials,
     [switch]$SelfTest
 )
 
@@ -133,14 +134,31 @@ function Get-ConnectedWifiName {
     return $null
 }
 
+function Select-FirstIPv4Address {
+    param([AllowEmptyCollection()][object[]]$Records)
+
+    foreach ($record in $Records) {
+        if ($null -eq $record) {
+            continue
+        }
+        $ipProperty = $record.PSObject.Properties['IPAddress']
+        if ($null -ne $ipProperty -and
+            $ipProperty.Value -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            return [string]$ipProperty.Value
+        }
+    }
+    return $null
+}
+
 function Test-DirectCampusInternet {
     param([Parameter(Mandatory = $true)][string]$UserIp)
 
     try {
-        $resolvedAddress = Resolve-DnsName -Name $script:OnlineCheckHost -Server $script:CampusDnsServer `
-            -Type A -DnsOnly -ErrorAction Stop |
-            Where-Object { $_.IPAddress -match '^\d{1,3}(\.\d{1,3}){3}$' } |
-            Select-Object -First 1 -ExpandProperty IPAddress
+        $dnsRecords = @(
+            Resolve-DnsName -Name $script:OnlineCheckHost -Server $script:CampusDnsServer `
+                -Type A -DnsOnly -ErrorAction Stop
+        )
+        $resolvedAddress = Select-FirstIPv4Address -Records $dnsRecords
 
         if ([string]::IsNullOrWhiteSpace($resolvedAddress)) {
             return $false
@@ -197,6 +215,57 @@ function Normalize-CampusAccount {
     }
 
     return ',0,' + $normalized
+}
+
+function ConvertFrom-StoredCampusAccount {
+    param([AllowEmptyString()][string]$Account)
+
+    $baseAccount = $Account
+    if ($baseAccount.StartsWith(',0,')) {
+        $baseAccount = $baseAccount.Substring(3)
+    }
+
+    $provider = '校园网'
+    $suffixes = @(
+        [pscustomobject]@{ Suffix = '@cmccn'; LegacySuffix = '@yd'; Provider = '中国移动' }
+        [pscustomobject]@{ Suffix = '@unicomn'; LegacySuffix = '@lt'; Provider = '中国联通' }
+        [pscustomobject]@{ Suffix = '@telecomn'; LegacySuffix = '@dx'; Provider = '中国电信' }
+    )
+    foreach ($item in $suffixes) {
+        foreach ($suffix in @($item.Suffix, $item.LegacySuffix)) {
+            if ($baseAccount.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $baseAccount = $baseAccount.Substring(0, $baseAccount.Length - $suffix.Length)
+                $provider = $item.Provider
+                break
+            }
+        }
+        if ($provider -ne '校园网') {
+            break
+        }
+    }
+
+    return [pscustomobject]@{
+        BaseAccount = $baseAccount
+        Provider = $provider
+    }
+}
+
+function New-StoredCampusAccount {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseAccount,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('校园网', '中国移动', '中国联通', '中国电信')]
+        [string]$Provider
+    )
+
+    $accountSettings = ConvertFrom-StoredCampusAccount -Account $BaseAccount.Trim()
+    $suffix = switch ($Provider) {
+        '中国移动' { '@cmccn' }
+        '中国联通' { '@unicomn' }
+        '中国电信' { '@telecomn' }
+        default { '' }
+    }
+    return $accountSettings.BaseAccount + $suffix
 }
 
 function Invoke-PortalRequest {
@@ -345,7 +414,188 @@ function Invoke-ConnectionAttempt {
     }
 }
 
-function Show-RetryOrCloseDialog {
+function Save-EncryptedCampusCredential {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseAccount,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('校园网', '中国移动', '中国联通', '中国电信')]
+        [string]$Provider
+    )
+
+    $temporaryCredential = $null
+    $securePassword = $null
+    $credential = $null
+    try {
+        $storedAccount = New-StoredCampusAccount -BaseAccount $BaseAccount -Provider $Provider
+        if ([string]::IsNullOrWhiteSpace($storedAccount) -or [string]::IsNullOrEmpty($Password)) {
+            throw '账号或密码不能为空。'
+        }
+
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($storedAccount, $securePassword)
+        $temporaryCredential = Join-Path $script:AppDirectory (
+            'credential.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        )
+        $credential | Export-Clixml -LiteralPath $temporaryCredential -Force
+        Move-Item -LiteralPath $temporaryCredential -Destination $script:CredentialPath -Force
+        $temporaryCredential = $null
+        Write-AppLog '用户更新了加密账号、密码或运营商出口。'
+    }
+    finally {
+        if ($null -ne $temporaryCredential -and (Test-Path -LiteralPath $temporaryCredential)) {
+            Remove-Item -LiteralPath $temporaryCredential -Force -ErrorAction SilentlyContinue
+        }
+        $storedAccount = $null
+        $credential = $null
+        $securePassword = $null
+        $Password = $null
+    }
+}
+
+function Show-CredentialEditorDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $accountSettings = [pscustomobject]@{ BaseAccount = ''; Provider = '校园网' }
+    try {
+        if (Test-Path -LiteralPath $script:CredentialPath) {
+            $existingCredential = Import-Clixml -LiteralPath $script:CredentialPath
+            if ($existingCredential -is [System.Management.Automation.PSCredential]) {
+                $accountSettings = ConvertFrom-StoredCampusAccount -Account $existingCredential.UserName
+            }
+        }
+    }
+    catch {
+        Write-AppLog ('读取现有账号设置失败：' + $_.Exception.Message)
+    }
+    finally {
+        $existingCredential = $null
+    }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '修改校园网账号密码'
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(500, 355)
+    $form.MinimumSize = $form.Size
+    $form.MaximumSize = $form.Size
+    $form.TopMost = $true
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $form.Tag = 'Cancelled'
+
+    $heading = New-Object System.Windows.Forms.Label
+    $heading.Text = '重新填写认证信息'
+    $heading.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 14, [System.Drawing.FontStyle]::Bold)
+    $heading.Location = New-Object System.Drawing.Point(28, 20)
+    $heading.Size = New-Object System.Drawing.Size(420, 34)
+    $form.Controls.Add($heading)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Text = '账号已为你预填；为安全起见，密码需要重新输入。'
+    $description.Location = New-Object System.Drawing.Point(30, 61)
+    $description.Size = New-Object System.Drawing.Size(420, 26)
+    $form.Controls.Add($description)
+
+    $accountLabel = New-Object System.Windows.Forms.Label
+    $accountLabel.Text = '统一身份认证账号'
+    $accountLabel.Location = New-Object System.Drawing.Point(31, 105)
+    $accountLabel.Size = New-Object System.Drawing.Size(130, 26)
+    $form.Controls.Add($accountLabel)
+
+    $accountBox = New-Object System.Windows.Forms.TextBox
+    $accountBox.Location = New-Object System.Drawing.Point(168, 102)
+    $accountBox.Size = New-Object System.Drawing.Size(285, 28)
+    $accountBox.Text = $accountSettings.BaseAccount
+    $form.Controls.Add($accountBox)
+
+    $passwordLabel = New-Object System.Windows.Forms.Label
+    $passwordLabel.Text = '新密码'
+    $passwordLabel.Location = New-Object System.Drawing.Point(31, 152)
+    $passwordLabel.Size = New-Object System.Drawing.Size(130, 26)
+    $form.Controls.Add($passwordLabel)
+
+    $passwordBox = New-Object System.Windows.Forms.TextBox
+    $passwordBox.Location = New-Object System.Drawing.Point(168, 149)
+    $passwordBox.Size = New-Object System.Drawing.Size(285, 28)
+    $passwordBox.UseSystemPasswordChar = $true
+    $form.Controls.Add($passwordBox)
+
+    $providerLabel = New-Object System.Windows.Forms.Label
+    $providerLabel.Text = '登录出口'
+    $providerLabel.Location = New-Object System.Drawing.Point(31, 199)
+    $providerLabel.Size = New-Object System.Drawing.Size(130, 26)
+    $form.Controls.Add($providerLabel)
+
+    $providerBox = New-Object System.Windows.Forms.ComboBox
+    $providerBox.Location = New-Object System.Drawing.Point(168, 196)
+    $providerBox.Size = New-Object System.Drawing.Size(285, 28)
+    $providerBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    [void]$providerBox.Items.Add('校园网')
+    [void]$providerBox.Items.Add('中国移动')
+    [void]$providerBox.Items.Add('中国联通')
+    [void]$providerBox.Items.Add('中国电信')
+    $providerBox.SelectedItem = $accountSettings.Provider
+    if ($providerBox.SelectedIndex -lt 0) {
+        $providerBox.SelectedIndex = 0
+    }
+    $form.Controls.Add($providerBox)
+
+    $saveButton = New-Object System.Windows.Forms.Button
+    $saveButton.Text = '保存并重试'
+    $saveButton.Location = New-Object System.Drawing.Point(252, 257)
+    $saveButton.Size = New-Object System.Drawing.Size(100, 34)
+    $form.Controls.Add($saveButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = '取消'
+    $cancelButton.Location = New-Object System.Drawing.Point(365, 257)
+    $cancelButton.Size = New-Object System.Drawing.Size(88, 34)
+    $form.Controls.Add($cancelButton)
+
+    $saveButton.Add_Click({
+        if ([string]::IsNullOrWhiteSpace($accountBox.Text)) {
+            [void][System.Windows.Forms.MessageBox]::Show('请输入统一身份认证账号。', $form.Text)
+            $accountBox.Focus()
+            return
+        }
+        if ([string]::IsNullOrEmpty($passwordBox.Text)) {
+            [void][System.Windows.Forms.MessageBox]::Show('请重新输入校园网密码。', $form.Text)
+            $passwordBox.Focus()
+            return
+        }
+        try {
+            Save-EncryptedCampusCredential -BaseAccount $accountBox.Text `
+                -Password $passwordBox.Text -Provider $providerBox.SelectedItem.ToString()
+            $passwordBox.Text = ''
+            $form.Tag = 'Saved'
+            $form.Close()
+        }
+        catch {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                ('保存失败：' + $_.Exception.Message),
+                $form.Text,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+    })
+    $cancelButton.Add_Click({
+        $passwordBox.Text = ''
+        $form.Tag = 'Cancelled'
+        $form.Close()
+    })
+
+    $form.AcceptButton = $saveButton
+    $form.CancelButton = $cancelButton
+    [void]$form.ShowDialog()
+    $passwordBox.Text = ''
+    return $form.Tag -eq 'Saved'
+}
+
+function Show-FailureDialog {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -354,45 +604,63 @@ function Show-RetryOrCloseDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '中南大学校园网自动连接'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(470, 245)
+    $form.Size = New-Object System.Drawing.Size(570, 245)
     $form.MinimumSize = $form.Size
     $form.MaximumSize = $form.Size
     $form.TopMost = $true
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.FormBorderStyle = 'FixedDialog'
+    $form.Tag = 'Close'
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = '自动连接失败'
     $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 13, [System.Drawing.FontStyle]::Bold)
     $title.Location = New-Object System.Drawing.Point(24, 20)
-    $title.Size = New-Object System.Drawing.Size(400, 32)
+    $title.Size = New-Object System.Drawing.Size(500, 32)
     $form.Controls.Add($title)
 
     $detail = New-Object System.Windows.Forms.Label
     $detail.Text = $Message
     $detail.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $detail.Location = New-Object System.Drawing.Point(26, 62)
-    $detail.Size = New-Object System.Drawing.Size(405, 75)
+    $detail.Size = New-Object System.Drawing.Size(505, 75)
     $form.Controls.Add($detail)
 
     $retryButton = New-Object System.Windows.Forms.Button
     $retryButton.Text = '重试'
-    $retryButton.Location = New-Object System.Drawing.Point(242, 154)
+    $retryButton.Location = New-Object System.Drawing.Point(231, 154)
     $retryButton.Size = New-Object System.Drawing.Size(88, 34)
-    $retryButton.DialogResult = [System.Windows.Forms.DialogResult]::Retry
+    $retryButton.Add_Click({
+        $form.Tag = 'Retry'
+        $form.Close()
+    })
     $form.Controls.Add($retryButton)
+
+    $editButton = New-Object System.Windows.Forms.Button
+    $editButton.Text = '修改账号密码'
+    $editButton.Location = New-Object System.Drawing.Point(331, 154)
+    $editButton.Size = New-Object System.Drawing.Size(112, 34)
+    $editButton.Add_Click({
+        $form.Tag = 'EditCredentials'
+        $form.Close()
+    })
+    $form.Controls.Add($editButton)
 
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = '关闭'
-    $closeButton.Location = New-Object System.Drawing.Point(343, 154)
+    $closeButton.Location = New-Object System.Drawing.Point(455, 154)
     $closeButton.Size = New-Object System.Drawing.Size(88, 34)
-    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $closeButton.Add_Click({
+        $form.Tag = 'Close'
+        $form.Close()
+    })
     $form.Controls.Add($closeButton)
 
     $form.AcceptButton = $retryButton
     $form.CancelButton = $closeButton
-    return $form.ShowDialog()
+    [void]$form.ShowDialog()
+    return [string]$form.Tag
 }
 
 function Invoke-SelfTest {
@@ -401,9 +669,23 @@ function Invoke-SelfTest {
     if ((Normalize-CampusAccount '123456@yd') -ne ',0,123456@cmccn') { $failures.Add('移动账号规范化失败') }
     if ((Normalize-CampusAccount ',0,123456@lt') -ne ',0,123456@unicomn') { $failures.Add('联通账号规范化失败') }
     if ((Normalize-CampusAccount '123456@dx') -ne ',0,123456@telecomn') { $failures.Add('电信账号规范化失败') }
+    if ((New-StoredCampusAccount -BaseAccount ',0,123456@yd' -Provider '中国联通') -ne '123456@unicomn') {
+        $failures.Add('账号编辑出口转换失败')
+    }
+    $editedAccount = ConvertFrom-StoredCampusAccount -Account '123456@telecomn'
+    if ($editedAccount.BaseAccount -ne '123456' -or $editedAccount.Provider -ne '中国电信') {
+        $failures.Add('账号编辑预填解析失败')
+    }
     if ((ConvertTo-CurlConfigValue 'a"b\c') -ne 'a\"b\\c') { $failures.Add('curl 配置转义失败') }
     if (-not (Test-PortalSuccess '{"result":"1","msg":"ok"}')) { $failures.Add('门户成功响应识别失败') }
     if (Test-PortalSuccess '{"result":"0","msg":"bad"}') { $failures.Add('门户失败响应识别失败') }
+    $mockDnsRecords = @(
+        [pscustomobject]@{ Name = 'alias.example'; Type = 'CNAME' }
+        [pscustomobject]@{ Name = 'target.example'; Type = 'A'; IPAddress = '203.0.113.10' }
+    )
+    if ((Select-FirstIPv4Address -Records $mockDnsRecords) -ne '203.0.113.10') {
+        $failures.Add('混合 DNS 记录解析失败')
+    }
     if (Test-Path -LiteralPath $systemCurlPath) {
         $expectedCurlPath = (Get-Item -LiteralPath $systemCurlPath).FullName
         if ($script:CurlPath -ne $expectedCurlPath) { $failures.Add('未优先使用 Windows 系统 curl.exe') }
@@ -436,6 +718,13 @@ if ($SelfTest) {
     exit 0
 }
 
+if ($EditCredentials) {
+    if (Show-CredentialEditorDialog) {
+        exit 0
+    }
+    exit 2
+}
+
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Local\CSUCampusAutoAuth', [ref]$createdNew)
 if (-not $createdNew) {
@@ -449,19 +738,33 @@ try {
     }
 
     $recoverSession = $false
-    while ($true) {
+    :connectionLoop while ($true) {
         $result = Invoke-ConnectionAttempt -RecoverSession:$recoverSession
         if ($result.Success) {
             exit 0
         }
 
         Write-AppLog ('准备提示用户：' + $result.Message)
-        $choice = Show-RetryOrCloseDialog -Message $result.Message
-        if ($choice -ne [System.Windows.Forms.DialogResult]::Retry) {
-            Write-AppLog '用户关闭了失败提示。'
-            exit 1
+        :promptLoop while ($true) {
+            $choice = Show-FailureDialog -Message $result.Message
+            switch ($choice) {
+                'Retry' {
+                    $recoverSession = $true
+                    continue connectionLoop
+                }
+                'EditCredentials' {
+                    if (Show-CredentialEditorDialog) {
+                        $recoverSession = $false
+                        continue connectionLoop
+                    }
+                    continue promptLoop
+                }
+                default {
+                    Write-AppLog '用户关闭了失败提示。'
+                    exit 1
+                }
+            }
         }
-        $recoverSession = $true
     }
 }
 finally {

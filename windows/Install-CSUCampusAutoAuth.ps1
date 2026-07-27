@@ -43,7 +43,7 @@ $heading.Size = New-Object System.Drawing.Size(430, 36)
 $form.Controls.Add($heading)
 
 $description = New-Object System.Windows.Forms.Label
-$description.Text = '当前用户登录 Windows 时运行一次；成功后静默退出，失败时可重试或关闭。'
+$description.Text = '当前用户登录 Windows 时运行一次；失败时可重试、修改凭据或关闭。'
 $description.Location = New-Object System.Drawing.Point(30, 65)
 $description.Size = New-Object System.Drawing.Size(430, 42)
 $form.Controls.Add($description)
@@ -177,7 +177,7 @@ try {
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentList -WindowStyle Hidden
 
     [void][System.Windows.Forms.MessageBox]::Show(
-        "安装完成。`n`n以后登录 Windows 时会自动尝试连接一次；成功后静默退出，失败时会提供重试和关闭按钮。",
+        "安装完成。`n`n以后登录 Windows 时会自动尝试连接一次；失败时可重试、修改账号密码或关闭。",
         '中南大学校园网自动连接',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information

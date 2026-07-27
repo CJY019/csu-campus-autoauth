@@ -11,7 +11,7 @@
 | 版本 | 文件位置 | 自动触发方式 | 失败后的行为 |
 | --- | --- | --- | --- |
 | Ubuntu/Linux systemd 版 | 仓库根目录 | 开机 30 秒后运行，并每两分钟复查 | 写入 journal，定时器稍后自动重试 |
-| Windows 10/11 版 | `windows/` | 当前用户登录 Windows 时运行一次 | 弹窗提示，可选择“重试”或“关闭” |
+| Windows 10/11 版 | `windows/` | 当前用户登录 Windows 时运行一次 | 弹窗提示，可重试、修改凭据或关闭 |
 
 两个版本不会混装，也不会共享凭据。Ubuntu/Linux 版保留适合无人值守主机的
 两分钟复查；Windows 版不在后台定时扫描，成功、已联网或不在
@@ -117,8 +117,9 @@ Windows 版的代码与说明位于 [`windows/`](windows/)。
 
 - 已联网或当前不在 `CSU-Student`：静默退出；
 - 连接成功：记录日志后立即退出；
-- 连接失败：弹出“重试 / 关闭”窗口；
+- 连接失败：弹出“重试 / 修改账号密码 / 关闭”窗口；
 - 点击“重试”：执行一次注销后重新认证；
+- 点击“修改账号密码”：重新填写账号、密码和运营商出口，保存后立即重试；
 - 点击“关闭”：结束本次运行。
 
 ### 手动触发测试
@@ -136,6 +137,12 @@ Windows 日志位置：
 
 ```text
 %LOCALAPPDATA%\CSUCampusAutoAuth\autoauth.log
+```
+
+随时主动修改账号、密码或运营商出口：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\CSUCampusAutoAuth\CSUCampusAutoAuth.ps1" -EditCredentials
 ```
 
 ### 卸载
