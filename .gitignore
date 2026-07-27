@@ -8,6 +8,11 @@ config/
 *.log
 *.pid
 *.lock
+autoauth.log*
+
+# Windows credentials are DPAPI-encrypted but still never belong in Git.
+credential.xml
+credential.*.tmp
 
 # Editor and OS files.
 .DS_Store
