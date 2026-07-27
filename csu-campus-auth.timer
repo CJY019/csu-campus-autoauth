@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check CSU campus network authentication
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=2min
+RandomizedDelaySec=10s
+AccuracySec=5s
+Persistent=true
+Unit=csu-campus-auth.service
+
+[Install]
+WantedBy=timers.target

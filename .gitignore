@@ -1,0 +1,17 @@
+# Never commit credentials or local configuration.
+credentials
+*.env
+*.conf
+config/
+
+# Runtime data and logs.
+*.log
+*.pid
+*.lock
+
+# Editor and OS files.
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
