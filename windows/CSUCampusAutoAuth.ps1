@@ -14,7 +14,14 @@ $script:PortalApi = 'https://10.1.1.1:802/eportal/portal'
 $script:OnlineCheckUrl = 'http://captive.apple.com/hotspot-detect.html'
 $script:OnlineCheckHost = 'captive.apple.com'
 $script:CampusDnsServer = '10.1.1.1'
-$script:CurlPath = (Get-Command 'curl.exe' -ErrorAction SilentlyContinue).Source
+$systemCurlPath = Join-Path $env:SystemRoot 'System32\curl.exe'
+if (Test-Path -LiteralPath $systemCurlPath) {
+    $script:CurlPath = $systemCurlPath
+}
+else {
+    $curlCommand = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+    $script:CurlPath = if ($null -ne $curlCommand) { $curlCommand.Source } else { $null }
+}
 
 function Write-AppLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -58,7 +65,7 @@ function Invoke-CurlConfig {
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $script:CurlPath
-    $startInfo.Arguments = '--config -'
+    $startInfo.Arguments = '--noproxy "*" --config -'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
@@ -130,7 +137,6 @@ function Test-DirectCampusInternet {
         }
 
         $config = @(
-            'noproxy = "*"'
             'fail'
             'silent'
             'show-error'
@@ -228,7 +234,6 @@ function Invoke-PortalRequest {
     }
 
     $config = New-Object System.Collections.Generic.List[string]
-    $config.Add('noproxy = "*"')
     $config.Add('insecure')
     $config.Add('silent')
     $config.Add('show-error')
@@ -396,6 +401,22 @@ function Invoke-SelfTest {
     if ((ConvertTo-CurlConfigValue 'a"b\c') -ne 'a\"b\\c') { $failures.Add('curl 配置转义失败') }
     if (-not (Test-PortalSuccess '{"result":"1","msg":"ok"}')) { $failures.Add('门户成功响应识别失败') }
     if (Test-PortalSuccess '{"result":"0","msg":"bad"}') { $failures.Add('门户失败响应识别失败') }
+    if (Test-Path -LiteralPath $systemCurlPath) {
+        $expectedCurlPath = (Get-Item -LiteralPath $systemCurlPath).FullName
+        if ($script:CurlPath -ne $expectedCurlPath) { $failures.Add('未优先使用 Windows 系统 curl.exe') }
+    }
+    try {
+        $curlTestUrl = 'file:///' + ($env:SystemRoot.Replace('\', '/')) + '/win.ini'
+        $curlTest = Invoke-CurlConfig -ConfigLines @(
+            'silent'
+            'show-error'
+            (New-CurlConfigLine -Name 'url' -Value $curlTestUrl)
+        )
+        if ($curlTest.ExitCode -ne 0) { $failures.Add('curl 标准输入配置兼容性测试失败') }
+    }
+    catch {
+        $failures.Add('curl 标准输入配置兼容性测试失败')
+    }
 
     if ($failures.Count -gt 0) {
         throw ($failures -join '；')
