@@ -16,6 +16,7 @@ $script:PortalApi = 'https://10.1.1.1:802/eportal/portal'
 $script:OnlineCheckUrl = 'http://captive.apple.com/hotspot-detect.html'
 $script:OnlineCheckHost = 'captive.apple.com'
 $script:CampusDnsServer = '10.1.1.1'
+$script:CampusWifiName = 'CSU-Student'
 $systemCurlPath = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (Test-Path -LiteralPath $systemCurlPath) {
     $script:CurlPath = $systemCurlPath
@@ -133,6 +134,42 @@ function Get-ConnectedWifiName {
         return $null
     }
     return $null
+}
+
+function Restart-CampusWifi {
+    Write-AppLog ('准备重新连接 ' + $script:CampusWifiName + '。')
+    $netshPath = Join-Path $env:SystemRoot 'System32\netsh.exe'
+
+    try {
+        & $netshPath wlan disconnect 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-AppLog ('断开 ' + $script:CampusWifiName + ' 失败。')
+            return $false
+        }
+
+        Start-Sleep -Seconds 2
+        & $netshPath wlan connect ('name=' + $script:CampusWifiName) 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-AppLog ('重新连接 ' + $script:CampusWifiName + ' 失败。')
+            return $false
+        }
+
+        for ($attempt = 1; $attempt -le 15; $attempt++) {
+            Start-Sleep -Seconds 2
+            if ((Get-ConnectedWifiName) -eq $script:CampusWifiName -and
+                -not [string]::IsNullOrWhiteSpace((Get-CampusIPv4))) {
+                Write-AppLog ('已经重新连接 ' + $script:CampusWifiName + ' 并取得校园网地址。')
+                return $true
+            }
+        }
+    }
+    catch {
+        Write-AppLog ('重新连接校园 Wi-Fi 时出错：' + $_.Exception.Message)
+        return $false
+    }
+
+    Write-AppLog ('重新连接 ' + $script:CampusWifiName + ' 后未能取得校园网地址。')
+    return $false
 }
 
 function Select-FirstIPv4Address {
@@ -386,6 +423,7 @@ function Invoke-ConnectionAttempt {
         return [pscustomobject]@{
             Success = $false
             Message = '已经连接 CSU-Student，但尚未获得 100.x 校园网地址。请稍候后重试。'
+            ReconnectWifiOnRetry = $true
         }
     }
 
@@ -440,7 +478,8 @@ function Invoke-ConnectionAttempt {
 
         return [pscustomobject]@{
             Success = $false
-            Message = '认证门户已接受登录，但公网仍不可用。'
+            Message = '认证门户已接受登录，但公网仍不可用。点击“重试”将重新连接 CSU-Student 后再次认证。'
+            ReconnectWifiOnRetry = $true
         }
     }
     catch {
@@ -791,8 +830,24 @@ try {
         Start-Sleep -Seconds 15
     }
 
+    $reconnectWifiBeforeAttempt = $false
     :connectionLoop while ($true) {
-        $result = Invoke-ConnectionAttempt
+        if ($reconnectWifiBeforeAttempt) {
+            $reconnectWifiBeforeAttempt = $false
+            if (-not (Restart-CampusWifi)) {
+                $result = [pscustomobject]@{
+                    Success = $false
+                    Message = '重新连接 CSU-Student 失败。请确认 Wi-Fi 已开启且已保存该网络，然后重试。'
+                    ReconnectWifiOnRetry = $true
+                }
+            }
+            else {
+                $result = Invoke-ConnectionAttempt
+            }
+        }
+        else {
+            $result = Invoke-ConnectionAttempt
+        }
         if ($result.Success) {
             exit 0
         }
@@ -802,6 +857,10 @@ try {
             $choice = Show-FailureDialog -Message $result.Message
             switch ($choice) {
                 'Retry' {
+                    $reconnectProperty = $result.PSObject.Properties['ReconnectWifiOnRetry']
+                    $reconnectWifiBeforeAttempt = (
+                        $null -ne $reconnectProperty -and [bool]$reconnectProperty.Value
+                    )
                     continue connectionLoop
                 }
                 'EditCredentials' {
