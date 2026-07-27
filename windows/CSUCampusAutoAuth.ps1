@@ -413,6 +413,8 @@ function Test-PortalSuccess {
 }
 
 function Invoke-ConnectionAttempt {
+    param([switch]$ForcePortalRecovery)
+
     $userIp = Get-CampusIPv4
     if ([string]::IsNullOrWhiteSpace($userIp)) {
         $wifiName = Get-ConnectedWifiName
@@ -453,6 +455,18 @@ function Invoke-ConnectionAttempt {
             throw '账号或密码为空。'
         }
 
+        if ($ForcePortalRecovery) {
+            Write-AppLog '准备清理旧的校园网门户会话。'
+            $logoutResponse = Invoke-PortalRequest -Action logout -UserIp $userIp
+            if ($logoutResponse.ExitCode -ne 0) {
+                Write-AppLog '门户未确认注销，仍继续执行一次登录恢复。'
+            }
+            else {
+                Write-AppLog '已发送门户注销请求，等待会话释放。'
+            }
+            Start-Sleep -Seconds 3
+        }
+
         $response = Invoke-PortalRequest -Action login -UserIp $userIp -Account $account -Password $plainPassword
         if ($response.ExitCode -ne 0) {
             $detail = $response.Error.Trim()
@@ -478,7 +492,7 @@ function Invoke-ConnectionAttempt {
 
         return [pscustomobject]@{
             Success = $false
-            Message = '认证门户已接受登录，但公网仍不可用。点击“重试”将重新连接 CSU-Student 后再次认证。'
+            Message = '认证门户已接受登录，但公网仍不可用。点击“重试”将重新连接 CSU-Student、清理旧会话后再次认证。'
             ReconnectWifiOnRetry = $true
         }
     }
@@ -842,7 +856,7 @@ try {
                 }
             }
             else {
-                $result = Invoke-ConnectionAttempt
+                $result = Invoke-ConnectionAttempt -ForcePortalRecovery
             }
         }
         else {
