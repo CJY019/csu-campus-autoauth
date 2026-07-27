@@ -118,7 +118,7 @@ Windows 版的代码与说明位于 [`windows/`](windows/)。
 - 已联网或当前不在 `CSU-Student`：静默退出；
 - 连接成功：记录日志后立即退出；
 - 连接失败：弹出“重试 / 修改账号密码 / 关闭”窗口；
-- 点击“重试”：执行一次注销后重新认证；
+- 点击“重试”：重新检查公网状态，仍离线时才再次认证，不主动注销现有会话；
 - 点击“修改账号密码”：重新填写账号、密码和运营商出口，保存后立即重试；
 - 点击“关闭”：结束本次运行。
 
@@ -132,6 +132,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\CSUCa
 
 这会立即执行一次，与登录启动行为相同，但不会等待启动时的 15 秒网络准备
 时间。若需要完整模拟登录启动，可在命令末尾加上 `-Startup`。
+
+仅测试校园网网卡的公网直连，不读取凭据、不调用认证门户：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\CSUCampusAutoAuth\CSUCampusAutoAuth.ps1" -ConnectivityTest
+```
 
 Windows 日志位置：
 
@@ -168,7 +174,8 @@ windows\Uninstall-CSUCampusAutoAuth.ps1
 ## 工作原理
 
 1. 从物理网卡读取 `100.x` 校园地址；
-2. 绑定该地址，通过校园 DNS 解析 Apple captive portal 检测地址；
+2. 绑定该地址，通过校园 DNS 解析 Apple captive portal，并以 Windows NCSI
+   作为备用联网探针；
 3. 已联网时直接退出；
 4. 未联网时规范化运营商后缀并调用 CSU eportal；
 5. 登录后再次进行直连公网检测；

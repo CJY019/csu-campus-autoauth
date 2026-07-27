@@ -2,6 +2,7 @@
 param(
     [switch]$Startup,
     [switch]$EditCredentials,
+    [switch]$ConnectivityTest,
     [switch]$SelfTest
 )
 
@@ -153,33 +154,80 @@ function Select-FirstIPv4Address {
 function Test-DirectCampusInternet {
     param([Parameter(Mandatory = $true)][string]$UserIp)
 
+    $probes = New-Object System.Collections.Generic.List[object]
+    $probes.Add([pscustomobject]@{
+        Name = 'Apple captive portal'
+        Host = $script:OnlineCheckHost
+        Url = $script:OnlineCheckUrl
+        ExpectedContent = @('<TITLE>Success</TITLE>', '<BODY>Success</BODY>')
+    })
+
     try {
-        $dnsRecords = @(
-            Resolve-DnsName -Name $script:OnlineCheckHost -Server $script:CampusDnsServer `
-                -Type A -DnsOnly -ErrorAction Stop
-        )
-        $resolvedAddress = Select-FirstIPv4Address -Records $dnsRecords
-
-        if ([string]::IsNullOrWhiteSpace($resolvedAddress)) {
-            return $false
+        $ncsiSettings = Get-ItemProperty -Path `
+            'HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet' `
+            -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($ncsiSettings.ActiveWebProbeHost) -and
+            -not [string]::IsNullOrWhiteSpace($ncsiSettings.ActiveWebProbePath) -and
+            -not [string]::IsNullOrWhiteSpace($ncsiSettings.ActiveWebProbeContent)) {
+            $ncsiUrl = 'http://' + $ncsiSettings.ActiveWebProbeHost + '/' +
+                $ncsiSettings.ActiveWebProbePath.TrimStart('/')
+            $probes.Add([pscustomobject]@{
+                Name = 'Windows NCSI'
+                Host = $ncsiSettings.ActiveWebProbeHost
+                Url = $ncsiUrl
+                ExpectedContent = @($ncsiSettings.ActiveWebProbeContent)
+            })
         }
-
-        $config = @(
-            (New-CurlConfigLine -Name 'interface' -Value $UserIp)
-            (New-CurlConfigLine -Name 'resolve' -Value ('{0}:80:{1}' -f $script:OnlineCheckHost, $resolvedAddress))
-            'connect-timeout = 4'
-            'max-time = 8'
-            (New-CurlConfigLine -Name 'url' -Value $script:OnlineCheckUrl)
-        )
-        $result = Invoke-CurlConfig -ConfigLines $config
-        return $result.ExitCode -eq 0 -and
-            $result.Output -like '*<TITLE>Success</TITLE>*' -and
-            $result.Output -like '*<BODY>Success</BODY>*'
     }
     catch {
-        Write-AppLog ('公网直连检测失败：' + $_.Exception.Message)
-        return $false
+        Write-AppLog ('无法读取 Windows NCSI 备用探针：' + $_.Exception.Message)
     }
+
+    $lastProbeError = $null
+    foreach ($probe in $probes) {
+        try {
+            $dnsRecords = @(
+                Resolve-DnsName -Name $probe.Host -Server $script:CampusDnsServer `
+                    -Type A -DnsOnly -ErrorAction Stop
+            )
+            $resolvedAddress = Select-FirstIPv4Address -Records $dnsRecords
+            if ([string]::IsNullOrWhiteSpace($resolvedAddress)) {
+                continue
+            }
+
+            $config = @(
+                (New-CurlConfigLine -Name 'interface' -Value $UserIp)
+                (New-CurlConfigLine -Name 'resolve' -Value ('{0}:80:{1}' -f $probe.Host, $resolvedAddress))
+                'connect-timeout = 4'
+                'max-time = 8'
+                (New-CurlConfigLine -Name 'url' -Value $probe.Url)
+            )
+            $result = Invoke-CurlConfig -ConfigLines $config
+            if ($result.ExitCode -ne 0) {
+                $lastProbeError = $result.Error.Trim()
+                continue
+            }
+
+            $contentMatched = $true
+            foreach ($expected in @($probe.ExpectedContent)) {
+                if ($result.Output -notlike ('*' + $expected + '*')) {
+                    $contentMatched = $false
+                    break
+                }
+            }
+            if ($contentMatched) {
+                return $true
+            }
+        }
+        catch {
+            $lastProbeError = $_.Exception.Message
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($lastProbeError)) {
+        Write-AppLog ('公网直连探针均失败：' + $lastProbeError)
+    }
+    return $false
 }
 
 function Wait-ForDirectCampusInternet {
@@ -328,8 +376,6 @@ function Test-PortalSuccess {
 }
 
 function Invoke-ConnectionAttempt {
-    param([switch]$RecoverSession)
-
     $userIp = Get-CampusIPv4
     if ([string]::IsNullOrWhiteSpace($userIp)) {
         $wifiName = Get-ConnectedWifiName
@@ -367,12 +413,6 @@ function Invoke-ConnectionAttempt {
         $plainPassword = $networkCredential.Password
         if ([string]::IsNullOrWhiteSpace($account) -or [string]::IsNullOrEmpty($plainPassword)) {
             throw '账号或密码为空。'
-        }
-
-        if ($RecoverSession) {
-            Write-AppLog '按用户选择执行一次注销后重试。'
-            [void](Invoke-PortalRequest -Action logout -UserIp $userIp)
-            Start-Sleep -Seconds 3
         }
 
         $response = Invoke-PortalRequest -Action login -UserIp $userIp -Account $account -Password $plainPassword
@@ -718,6 +758,20 @@ if ($SelfTest) {
     exit 0
 }
 
+if ($ConnectivityTest) {
+    $connectivityTestIp = Get-CampusIPv4
+    if ([string]::IsNullOrWhiteSpace($connectivityTestIp)) {
+        Write-Output 'Connectivity test failed: no physical 100.x campus IPv4 address.'
+        exit 2
+    }
+    if (Test-DirectCampusInternet -UserIp $connectivityTestIp) {
+        Write-Output 'Connectivity test passed: direct Internet access is available.'
+        exit 0
+    }
+    Write-Output 'Connectivity test failed: direct Internet probes did not confirm access.'
+    exit 1
+}
+
 if ($EditCredentials) {
     if (Show-CredentialEditorDialog) {
         exit 0
@@ -737,9 +791,8 @@ try {
         Start-Sleep -Seconds 15
     }
 
-    $recoverSession = $false
     :connectionLoop while ($true) {
-        $result = Invoke-ConnectionAttempt -RecoverSession:$recoverSession
+        $result = Invoke-ConnectionAttempt
         if ($result.Success) {
             exit 0
         }
@@ -749,12 +802,10 @@ try {
             $choice = Show-FailureDialog -Message $result.Message
             switch ($choice) {
                 'Retry' {
-                    $recoverSession = $true
                     continue connectionLoop
                 }
                 'EditCredentials' {
                     if (Show-CredentialEditorDialog) {
-                        $recoverSession = $false
                         continue connectionLoop
                     }
                     continue promptLoop
