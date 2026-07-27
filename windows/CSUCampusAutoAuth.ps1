@@ -65,18 +65,28 @@ function Invoke-CurlConfig {
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $script:CurlPath
-    $startInfo.Arguments = '--noproxy "*" --config -'
+    $startInfo.Arguments = '--noproxy "*" --insecure --fail --silent --show-error --get --config -'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $startInfo.StandardOutputEncoding = $utf8NoBom
+    $startInfo.StandardErrorEncoding = $utf8NoBom
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
-    [void]$process.Start()
-    $process.StandardInput.WriteLine(($ConfigLines -join "`n"))
-    $process.StandardInput.Close()
+    $originalInputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = $utf8NoBom
+        [void]$process.Start()
+        $process.StandardInput.WriteLine(($ConfigLines -join "`n"))
+        $process.StandardInput.Close()
+    }
+    finally {
+        [Console]::InputEncoding = $originalInputEncoding
+    }
     $standardOutput = $process.StandardOutput.ReadToEnd()
     $standardError = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
@@ -137,9 +147,6 @@ function Test-DirectCampusInternet {
         }
 
         $config = @(
-            'fail'
-            'silent'
-            'show-error'
             (New-CurlConfigLine -Name 'interface' -Value $UserIp)
             (New-CurlConfigLine -Name 'resolve' -Value ('{0}:80:{1}' -f $script:OnlineCheckHost, $resolvedAddress))
             'connect-timeout = 4'
@@ -234,13 +241,9 @@ function Invoke-PortalRequest {
     }
 
     $config = New-Object System.Collections.Generic.List[string]
-    $config.Add('insecure')
-    $config.Add('silent')
-    $config.Add('show-error')
     $config.Add((New-CurlConfigLine -Name 'interface' -Value $UserIp))
     $config.Add('connect-timeout = 5')
     $config.Add('max-time = 20')
-    $config.Add('get')
     foreach ($item in $data) {
         $config.Add((New-CurlConfigLine -Name 'data-urlencode' -Value $item))
     }
@@ -408,14 +411,18 @@ function Invoke-SelfTest {
     try {
         $curlTestUrl = 'file:///' + ($env:SystemRoot.Replace('\', '/')) + '/win.ini'
         $curlTest = Invoke-CurlConfig -ConfigLines @(
-            'silent'
-            'show-error'
             (New-CurlConfigLine -Name 'url' -Value $curlTestUrl)
         )
-        if ($curlTest.ExitCode -ne 0) { $failures.Add('curl 标准输入配置兼容性测试失败') }
+        if ($curlTest.ExitCode -ne 0) {
+            $curlTestError = $curlTest.Error.Trim()
+            if ([string]::IsNullOrWhiteSpace($curlTestError)) {
+                $curlTestError = 'curl exit code ' + $curlTest.ExitCode
+            }
+            $failures.Add('curl 标准输入配置兼容性测试失败：' + $curlTestError)
+        }
     }
     catch {
-        $failures.Add('curl 标准输入配置兼容性测试失败')
+        $failures.Add('curl 标准输入配置兼容性测试失败：' + $_.Exception.Message)
     }
 
     if ($failures.Count -gt 0) {
