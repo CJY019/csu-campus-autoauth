@@ -355,7 +355,7 @@ function New-StoredCampusAccount {
 
 function Invoke-PortalRequest {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('login', 'logout')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('login', 'logout', 'unbind')][string]$Action,
         [Parameter(Mandatory = $true)][string]$UserIp,
         [string]$Account,
         [string]$Password
@@ -378,7 +378,7 @@ function Invoke-PortalRequest {
         $milliseconds = [int64](([DateTime]::UtcNow - [DateTime]'1970-01-01').TotalMilliseconds)
         $data.Add('v=' + $milliseconds)
     }
-    else {
+    elseif ($Action -eq 'logout') {
         $data.Add('callback=csu_auth_logout')
         $data.Add('login_method=1')
         $data.Add('user_account=drcom')
@@ -393,6 +393,10 @@ function Invoke-PortalRequest {
         $data.Add('wlan_ac_name=')
         $data.Add('jsVersion=4.1.3')
     }
+    else {
+        $data.Add('callback=csu_auth_unbind')
+        $data.Add('user_account=' + $Account)
+    }
 
     $config = New-Object System.Collections.Generic.List[string]
     $config.Add((New-CurlConfigLine -Name 'interface' -Value $UserIp))
@@ -401,7 +405,8 @@ function Invoke-PortalRequest {
     foreach ($item in $data) {
         $config.Add((New-CurlConfigLine -Name 'data-urlencode' -Value $item))
     }
-    $config.Add((New-CurlConfigLine -Name 'url' -Value ($script:PortalApi + '/' + $Action)))
+    $endpoint = if ($Action -eq 'unbind') { '/mac/unbind' } else { '/' + $Action }
+    $config.Add((New-CurlConfigLine -Name 'url' -Value ($script:PortalApi + $endpoint)))
 
     return Invoke-CurlConfig -ConfigLines $config.ToArray()
 }
@@ -410,6 +415,44 @@ function Test-PortalSuccess {
     param([AllowEmptyString()][string]$Response)
 
     return $Response -match '"result"\s*:\s*"?(1|ok)"?'
+}
+
+function Get-PortalFailureMessage {
+    param([AllowEmptyString()][string]$Response)
+
+    if ([string]::IsNullOrWhiteSpace($Response)) {
+        return $null
+    }
+
+    $message = $null
+    $jsonText = $Response.Trim()
+    $jsonpMatch = [regex]::Match($jsonText, '^[^(]+\((.*)\)\s*;?\s*$', 'Singleline')
+    if ($jsonpMatch.Success) {
+        $jsonText = $jsonpMatch.Groups[1].Value
+    }
+
+    try {
+        $payload = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        $messageProperty = $payload.PSObject.Properties['msg']
+        if ($null -ne $messageProperty) {
+            $message = [string]$messageProperty.Value
+        }
+    }
+    catch {
+        $messageMatch = [regex]::Match($Response, '"msg"\s*:\s*"([^"]*)"')
+        if ($messageMatch.Success) {
+            $message = $messageMatch.Groups[1].Value
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        return $null
+    }
+
+    $message = $message -replace '(?i)<br\s*/?>', "`r`n"
+    $message = $message -replace '\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '[校园网地址]'
+    $message = $message -replace '\b\d{8,}\b', '[账号]'
+    return $message.Trim()
 }
 
 function Invoke-ConnectionAttempt {
@@ -456,6 +499,17 @@ function Invoke-ConnectionAttempt {
         }
 
         if ($ForcePortalRecovery) {
+            $baseAccount = (ConvertFrom-StoredCampusAccount -Account $account).BaseAccount
+            Write-AppLog '准备解绑旧的校园网设备会话。'
+            $unbindResponse = Invoke-PortalRequest -Action unbind -UserIp $userIp -Account $baseAccount
+            if ($unbindResponse.ExitCode -ne 0) {
+                Write-AppLog '门户未确认设备解绑，仍继续执行一次注销和登录恢复。'
+            }
+            else {
+                Write-AppLog '已发送设备解绑请求，等待绑定释放。'
+            }
+            Start-Sleep -Seconds 2
+
             Write-AppLog '准备清理旧的校园网门户会话。'
             $logoutResponse = Invoke-PortalRequest -Action logout -UserIp $userIp
             if ($logoutResponse.ExitCode -ne 0) {
@@ -477,10 +531,16 @@ function Invoke-ConnectionAttempt {
         }
 
         if (-not (Test-PortalSuccess -Response $response.Output)) {
-            Write-AppLog '校园网认证门户拒绝了登录请求或返回了未知结果。'
+            $portalMessage = Get-PortalFailureMessage -Response $response.Output
+            if ([string]::IsNullOrWhiteSpace($portalMessage)) {
+                $portalMessage = '校园网认证门户拒绝了登录请求或返回了未知结果。'
+            }
+            Write-AppLog ('校园网认证未通过：' + ($portalMessage -replace '\r?\n', ' / '))
             return [pscustomobject]@{
                 Success = $false
-                Message = '认证未通过。请检查统一身份认证账号、密码和运营商出口。'
+                Message = '认证未通过：' + $portalMessage +
+                    [Environment]::NewLine +
+                    '请检查账号、密码和运营商出口，或点击“修改账号密码”。'
             }
         }
 
@@ -772,6 +832,10 @@ function Invoke-SelfTest {
     if ((ConvertTo-CurlConfigValue 'a"b\c') -ne 'a\"b\\c') { $failures.Add('curl 配置转义失败') }
     if (-not (Test-PortalSuccess '{"result":"1","msg":"ok"}')) { $failures.Add('门户成功响应识别失败') }
     if (Test-PortalSuccess '{"result":"0","msg":"bad"}') { $failures.Add('门户失败响应识别失败') }
+    $portalFailureTest = Get-PortalFailureMessage 'dr1004({"result":0,"msg":"电信错误代码99<br/>请稍后重试"});'
+    if ($portalFailureTest -notlike "电信错误代码99*请稍后重试") {
+        $failures.Add('门户失败消息解析失败')
+    }
     $mockDnsRecords = @(
         [pscustomobject]@{ Name = 'alias.example'; Type = 'CNAME' }
         [pscustomobject]@{ Name = 'target.example'; Type = 'A'; IPAddress = '203.0.113.10' }
